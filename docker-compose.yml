@@ -1,0 +1,86 @@
+services:
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXTAUTH_URL=http://localhost:3000
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - API_INTERNAL_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - backtester_net
+
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/backtester
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=change-this-to-a-random-64-char-string
+      - ACCESS_TOKEN_EXPIRE_MINUTES=10080
+      - ALGORITHM=HS256
+    depends_on:
+      - db
+      - redis
+    networks:
+      - backtester_net
+
+  worker:
+    build: ./backend
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/backtester
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=change-this-to-a-random-64-char-string
+      - ACCESS_TOKEN_EXPIRE_MINUTES=10080
+      - ALGORITHM=HS256
+    depends_on:
+      - db
+      - redis
+    networks:
+      - backtester_net
+
+  db:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=backtester
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backtester_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - backtester_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+networks:
+  backtester_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

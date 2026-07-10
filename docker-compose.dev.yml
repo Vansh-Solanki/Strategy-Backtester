@@ -1,0 +1,20 @@
+services:
+
+  frontend:
+    build:
+      target: deps
+    command: sh -c "npm run dev"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - WATCHPACK_POLLING=true
+
+  api:
+    volumes:
+      - ./backend:/app
+
+  worker:
+    volumes:
+      - ./backend:/app
