@@ -5,9 +5,10 @@ asyncpg==0.30.0
 alembic==1.14.0
 celery==5.4.0
 redis==5.2.1
-yfinance==0.2.51
+yfinance==1.5.1
 pandas==2.2.3
 numpy==2.2.1
+requests==2.32.3
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 pydantic==2.10.4

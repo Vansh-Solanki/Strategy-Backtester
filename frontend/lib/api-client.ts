@@ -23,6 +23,34 @@ export interface TokenResponse {
   token_type: string;
 }
 
+export interface TickerSearchResult {
+  symbol: string;
+  name: string;
+  exchange: string | null;
+}
+
+export interface PriceBar {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  adj_close: number;
+  volume: number;
+}
+
+export interface FetchJobResponse {
+  job_id: string;
+  status: string;
+}
+
+export interface JobStatusResponse {
+  job_id: string;
+  status: string;
+}
+
+export type MarketDataResponse = PriceBar[] | FetchJobResponse;
+
 class APIError extends Error {
   status: number;
 
@@ -67,6 +95,17 @@ export const apiClient = {
     request<UserResponse>("/users/me", {
       headers: { Authorization: `Bearer ${accessToken}` },
     }),
+
+  searchTickers: (query: string) =>
+    request<TickerSearchResult[]>(`/tickers/search?q=${encodeURIComponent(query)}`),
+
+  getMarketData: (symbol: string, start: string, end: string) =>
+    request<MarketDataResponse>(
+      `/market-data/${encodeURIComponent(symbol)}?start=${start}&end=${end}`
+    ),
+
+  getJobStatus: (symbol: string, jobId: string) =>
+    request<JobStatusResponse>(`/market-data/${encodeURIComponent(symbol)}/status/${jobId}`),
 };
 
 export { APIError };
