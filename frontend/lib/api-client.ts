@@ -51,6 +51,35 @@ export interface JobStatusResponse {
 
 export type MarketDataResponse = PriceBar[] | FetchJobResponse;
 
+export interface StrategyConfig {
+  code: string;
+  params: Record<string, unknown>;
+  position_size: number;
+  stop_loss: number;
+}
+
+export interface Strategy {
+  id: string;
+  user_id: string;
+  name: string;
+  description: string | null;
+  config: StrategyConfig;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StrategyTemplate {
+  name: string;
+  description: string;
+  code: string;
+  default_params: Record<string, unknown>;
+}
+
+export interface ValidateResponse {
+  valid: boolean;
+  errors: string[];
+}
+
 class APIError extends Error {
   status: number;
 
@@ -106,6 +135,51 @@ export const apiClient = {
 
   getJobStatus: (symbol: string, jobId: string) =>
     request<JobStatusResponse>(`/market-data/${encodeURIComponent(symbol)}/status/${jobId}`),
+
+  getStrategyTemplates: () => request<StrategyTemplate[]>("/strategies/templates"),
+
+  validateStrategyCode: (code: string) =>
+    request<ValidateResponse>("/strategies/validate", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+
+  listStrategies: (accessToken: string) =>
+    request<Strategy[]>("/strategies", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }),
+
+  getStrategy: (accessToken: string, id: string) =>
+    request<Strategy>(`/strategies/${id}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }),
+
+  createStrategy: (
+    accessToken: string,
+    input: { name: string; description: string | null; config: StrategyConfig }
+  ) =>
+    request<Strategy>("/strategies", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(input),
+    }),
+
+  updateStrategy: (
+    accessToken: string,
+    id: string,
+    input: { name?: string; description?: string | null; config?: StrategyConfig }
+  ) =>
+    request<Strategy>(`/strategies/${id}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(input),
+    }),
+
+  deleteStrategy: (accessToken: string, id: string) =>
+    request<null>(`/strategies/${id}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }),
 };
 
 export { APIError };

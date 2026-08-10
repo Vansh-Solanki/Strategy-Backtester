@@ -63,7 +63,7 @@
 |---|---|---|---|
 | 1 | Foundation | Days 1–3 | ✅ Complete |
 | 2 | Data layer | Days 4–6 | ✅ Complete |
-| 3 | Strategy builder | Days 7–10 | ⏳ Not started |
+| 3 | Strategy builder | Days 7–10 | ✅ Complete |
 | 4 | Backtest engine | Days 11–14 | ⏳ Not started |
 | 5 | Visualisations | Days 15–18 | ⏳ Not started |
 | 6 | Advanced features | Days 19–22 | ⏳ Not started |
@@ -175,7 +175,7 @@ strategy-backtester/
 │   │   ├── auth.ts                    # NextAuth config: CredentialsProvider + JWT
 │   │   ├── db.ts                      # pg client — used only by NextAuth adapter
 │   │   └── api-client.ts             # Typed fetch wrapper for FastAPI calls
-│   ├── middleware.ts                  # Redirect unauthenticated users to /sign-in
+│   ├── proxy.ts                       # Route protection — redirects unauthenticated users to /sign-in (Next.js 16 renamed middleware.ts to proxy.ts)
 │   ├── .env.local                     # NEXTAUTH_SECRET, DATABASE_URL, API_URL
 │   ├── next.config.ts
 │   ├── tailwind.config.ts
@@ -237,7 +237,16 @@ strategy-backtester/
 | `created_at` | TIMESTAMP | Default now() |
 | `updated_at` | TIMESTAMP | Default now() |
 
-> The `config` column is JSONB intentionally. Example value: `{"type": "sma_crossover", "fast_window": 20, "slow_window": 50, "position_size": 0.10, "stop_loss": 0.05}`. Using JSONB means adding new strategy types in Phase 3 requires no schema migration.
+> The `config` column is JSONB intentionally. As of Phase 3, it stores raw Python code and a free-form params dict — no `type` enum, no hardcoded strategy fields. Example value:
+> ```json
+> {
+>   "code": "import pandas as pd\n\ndef should_enter(row, hist, p):\n    fast = hist['adj_close'].rolling(p['fast']).mean().iloc[-1]\n    slow = hist['adj_close'].rolling(p['slow']).mean().iloc[-1]\n    return fast > slow\n\ndef should_exit(row, hist, p, pos):\n    fast = hist['adj_close'].rolling(p['fast']).mean().iloc[-1]\n    slow = hist['adj_close'].rolling(p['slow']).mean().iloc[-1]\n    return fast < slow\n\nparams = {'fast': 20, 'slow': 50}",
+>   "params": { "fast": 20, "slow": 50 },
+>   "position_size": 0.10,
+>   "stop_loss": 0.05
+> }
+> ```
+> Using JSONB means the user can write any Python strategy without any schema migration.
 
 #### Table: `backtests`
 
@@ -265,12 +274,12 @@ strategy-backtester/
 | `symbol` | VARCHAR(20) | Not null |
 | `entry_date` | TIMESTAMP | Not null |
 | `exit_date` | TIMESTAMP | Nullable (open position) |
-| `entry_price` | FLOAT | Not null |
-| `exit_price` | FLOAT | Nullable |
+| `entry_price` | DECIMAL(12,4) | Not null |
+| `exit_price` | DECIMAL(12,4) | Nullable |
 | `quantity` | INTEGER | Not null |
 | `direction` | VARCHAR(5) | "long" or "short" |
-| `pnl` | FLOAT | Nullable — calculated on exit |
-| `pnl_pct` | FLOAT | Nullable — percentage return |
+| `pnl` | DECIMAL(12,4) | Nullable — calculated on exit |
+| `pnl_pct` | DECIMAL(8,4) | Nullable — percentage return |
 
 #### Relationships
 
@@ -571,10 +580,14 @@ frontend/
 ├── components/
 │   └── market-data/
 │       ├── ticker-search.tsx      # Debounced autocomplete with keyboard nav
-│       └── price-chart.tsx        # Recharts ComposedChart (line + volume bars)
+│       ├── date-range-picker.tsx  # Two date inputs + quick presets (1M, 6M, YTD, 1Y, 5Y, MAX); commits on blur only
+│       ├── price-chart.tsx        # Recharts ComposedChart — candlestick (default) or line, plus volume bars
+│       └── candlestick-bar.tsx    # Two range-valued Bar shapes (wick + body) for OHLC candlesticks — see Decisions Log
 └── lib/
-    └── hooks/
-        └── use-ticker-search.ts   # Debounced search hook (300ms)
+    ├── hooks/
+    │   └── use-ticker-search.ts   # Debounced search hook (300ms)
+    └── store/
+        └── market-data-store.ts   # Zustand store: selectedTicker, dateRange, chartType ('candlestick' | 'line')
 
 alembic/versions/
 ├── 002_add_tickers_table.py
@@ -611,7 +624,7 @@ All responses use the same generic envelope as Phase 1:
 
 #### `seed_tickers_from_edgar()`
 
-- **When:** Triggered once on worker container startup via Celery `on_after_finalize` signal
+- **When:** Triggered once on worker container startup via Celery `worker_ready` signal (not `on_after_finalize` — see Decisions Log)
 - **Source:** `https://www.sec.gov/files/company_tickers.json` — free government endpoint, no API key
 - **What it returns:** A flat JSON object with ~10,000 entries: `{cik_str, ticker, title}`
 - **What it does:** Upserts each row into `tickers` using `INSERT ... ON CONFLICT (symbol) DO UPDATE SET name = EXCLUDED.name`
@@ -703,19 +716,60 @@ def is_fresh(latest_date: date) -> bool:
 
 #### `PriceChart` (`components/market-data/price-chart.tsx`)
 
-- Reads `selectedTicker` and `dateRange` from Zustand store
+- Reads `selectedTicker`, `dateRange`, and `chartType` from Zustand store
 - On ticker or date-range change: calls `GET /market-data/{symbol}?start={dateRange.start}&end={dateRange.end}`
 - Three render states:
   - **Loading:** skeleton placeholder matching the chart dimensions
   - **Fetching (job queued):** "Fetching prices for {SYMBOL}..." with a progress indicator; polls `/market-data/{symbol}/status/{job_id}` every 2 seconds
   - **Loaded:** full Recharts `ComposedChart`
-- Chart internals:
+- **Chart type toggle** (top-right corner of the chart card): "Candlestick" | "Line" button group. Default is candlestick. State stored in Zustand `chartType` field so the preference persists across ticker changes.
+- **Candlestick mode (default):**
+  - Y-axis domain is `[floor(min(low) * 0.99, 2dp), ceil(max(high) * 1.01, 2dp)]` across the visible range — not just close prices
+  - Rendered as **two range-valued `Bar` layers** (see `candlestick-bar.tsx` below), not a single `dataKey="close"` Bar with a scale-hacking shape (see Decisions Log — the originally-planned `props.yAxis.scale` approach does not work on the installed Recharts version and was replaced)
+  - Green bars (`#1D9E75`) when `close >= open`; red bars (`#E24B4A`) when `close < open`
+  - `Bar` for volume on a secondary Y-axis (lower opacity, always visible in both modes)
+- **Line mode:**
   - `Line` for adjusted close price (primary Y-axis)
-  - `Bar` for volume (secondary Y-axis, lower opacity)
-  - `XAxis` with date ticks formatted as `MMM 'YY`, at exact tick positions computed by `computeTicks()` (picks up to 10 evenly-spaced bars by index, always including the true first/last) rather than Recharts' `interval`/`minTickGap` heuristics — those were found live to mislabel the axis start once the bar count got large, even though the underlying data was correct
-  - `YAxis` left with `$` prefix, right with abbreviated volume (e.g. `12.3M`)
+  - `Bar` for volume on secondary Y-axis
+- **Common to both modes:**
+  - `XAxis` with date ticks computed by `computeTicks()` — picks up to 10 evenly-spaced bars by index, always including the true first/last. Recharts' `interval`/`minTickGap` heuristics mislabel the axis start on large bar counts even though the underlying data is correct
+  - Price `YAxis` uses hand-computed, rounded `ticks` for the same reason (see Decisions Log) — `$` prefix, 2 decimal places; right Y-axis abbreviated volume (e.g. `12.3M`)
   - `Tooltip` showing full OHLCV breakdown on hover
   - `ReferenceLine` at the mean adjusted close price
+
+#### `candlestick-bar.tsx` (`components/market-data/candlestick-bar.tsx`)
+
+Renders a proper OHLC candlestick using **two `<Bar>` elements with array-valued (range) `dataKey`s**, not a single Bar with a scale-hacking custom shape. Recharts natively supports a `dataKey` that resolves to a `[min, max]` tuple for floating/range bars — `computeBarRectangles` maps both ends through the real axis scale (`yAxis.scale.map`) itself, so no manual scale access is needed at all:
+
+```tsx
+export function toCandleData(bars: PriceBar[]): CandleDatum[] {
+  return bars
+    .filter((b) => Number.isFinite(b.low) && Number.isFinite(b.high) && Number.isFinite(b.open) && Number.isFinite(b.close))
+    .map((bar) => ({
+      ...bar,
+      wickRange: [bar.low, bar.high],
+      bodyRange: [Math.min(bar.open, bar.close), Math.max(bar.open, bar.close)],
+    }));
+}
+
+export function WickShape({ x, y, width, height, payload }) {
+  const fill = payload.close >= payload.open ? GREEN : RED;
+  const midX = x + width / 2;
+  return <rect x={midX - 0.5} y={y} width={1} height={Math.max(height, 1)} fill={fill} />;
+}
+
+export function BodyShape({ x, y, width, height, payload }) {
+  const fill = payload.close >= payload.open ? GREEN : RED;
+  return <rect x={x} y={y} width={width} height={Math.max(height, 1)} fill={fill} />;
+}
+```
+
+Used in `price-chart.tsx` as:
+
+```tsx
+<Bar yAxisId="price" dataKey="wickRange" barSize={1} shape={WickShape} isAnimationActive={false} legendType="none" />
+<Bar yAxisId="price" dataKey="bodyRange" shape={BodyShape} isAnimationActive={false} legendType="none" />
+```
 
 ---
 
@@ -750,11 +804,13 @@ def is_fresh(latest_date: date) -> bool:
 
 - [x] Create `frontend/lib/hooks/use-ticker-search.ts` — debounced search hook (300ms)
 - [x] Create `frontend/components/market-data/ticker-search.tsx` — autocomplete with keyboard nav
-- [x] Create `frontend/components/market-data/price-chart.tsx` — Recharts ComposedChart with line + volume bars
-- [x] Create `frontend/app/(dashboard)/market-data/page.tsx` — assembles `TickerSearch` + `PriceChart`
+- [x] Create `frontend/components/market-data/date-range-picker.tsx` — two date inputs + quick presets (1M, 6M, YTD, 1Y, 5Y, MAX); commits to Zustand store on blur only with 4-digit year plausibility check
+- [x] Create `frontend/components/market-data/candlestick-bar.tsx` — two range-valued Bar shapes (wick + body); green/red fill based on `close >= open` (originally spec'd as a `props.yAxis.scale`-hacking single Bar shape; that never actually shipped in the initial Phase 2 pass and was corrected during Phase 3 QA — see Decisions Log)
+- [x] Create `frontend/components/market-data/price-chart.tsx` — Recharts ComposedChart with candlestick as default + line toggle + volume bars; chart type stored in Zustand
+- [x] Create `frontend/app/(dashboard)/market-data/page.tsx` — assembles `TickerSearch` + `DateRangePicker` + `PriceChart`
 - [x] Add "Market Data" nav link to `frontend/components/layout/sidebar.tsx`
-- [x] Add `selectedTicker` field to Zustand store
-- [x] **Verify:** Search "TSLA" in the browser → dropdown appears → select Tesla → Recharts chart loads with 2 years of real price history (confirmed live in-browser with NVDA/AAPL, including custom date ranges back to the 1990s and 5Y/MAX presets)
+- [x] Add `selectedTicker`, `dateRange`, and `chartType` fields to Zustand store
+- [x] **Verify:** Search "TSLA"/"NVDA" in the browser → dropdown appears → select ticker → candlestick chart loads with green/red candles and volume bars; toggle to line view renders adj_close line; date presets update the range correctly (confirmed live in-browser with NVDA across the full 2022–2026 range, 1133 bars, zero console errors on the final pass)
 
 ---
 
@@ -772,7 +828,263 @@ def is_fresh(latest_date: date) -> bool:
 
 ## Phase 3: Strategy Builder (Days 7–10)
 
-> Status: ⏳ Not started.
+### Goals
+
+Build the full strategy authoring experience. A user can write arbitrary Python trading logic in a Monaco Editor pane, configure run parameters, get live validation feedback, pick from six predefined code templates, and save their strategy. No code is executed in Phase 3 — execution is Phase 4's job. Phase 3 is purely about authoring and persistence.
+
+The target user is a developer, not a pure trader. The Monaco editor is the primary interface. Predefined templates load as editable code, not locked black boxes. The `params` dict gives the user full control over what variables their strategy receives.
+
+---
+
+### Strategy Config — Revised Schema
+
+The `strategies.config` JSONB column stores the full strategy definition:
+
+```json
+{
+  "code": "import pandas as pd\n\ndef should_enter(row, hist, p):\n    ...",
+  "params": { "fast": 20, "slow": 50 },
+  "position_size": 0.10,
+  "stop_loss": 0.05
+}
+```
+
+There are no `"type"` enums or hardcoded strategy fields. Every strategy is raw Python. The `params` dict is whatever the user defines — it is passed directly as the `p` argument to `should_enter()` and `should_exit()` at backtest time.
+
+---
+
+### Sandbox API Contract
+
+Every strategy must implement at minimum `should_enter` and `should_exit`. An optional `on_start` hook runs once before the bar loop and is useful for pre-computing indicator series to avoid O(n²) per-bar rolling computation.
+
+```python
+# ── Variables injected per bar by the backtest engine (Phase 4) ──────────
+# row  : dict        — {'date', 'open', 'high', 'low', 'close', 'adj_close', 'volume'}
+# hist : pd.DataFrame — all bars from start up to and including the current bar
+# p    : dict        — your params dict from strategies.config["params"]
+# pos  : dict | None — None when flat; else {'entry_price', 'entry_date', 'shares'}
+
+import pandas as pd
+import numpy as np
+
+# Optional — called once before the bar loop starts
+def on_start(hist: pd.DataFrame, p: dict) -> None:
+    pass
+
+def should_enter(row: dict, hist: pd.DataFrame, p: dict) -> bool:
+    """Return True to open a long position at this bar's close price."""
+    ...
+
+def should_exit(row: dict, hist: pd.DataFrame, p: dict, pos: dict) -> bool:
+    """Return True to close the current position at this bar's close price."""
+    ...
+```
+
+**Allowed imports:** `pandas`, `numpy` only. No network access, no filesystem. Execution timeout: 30 seconds per backtest. Memory cap: 256MB. `print()` output is captured and surfaced in the console panel.
+
+> **Execution sandbox (Phase 4, revised):** Strategy code will run in an isolated subprocess per backtest — not in-process `RestrictedPython`. The worker spawns a locked-down Python subprocess (resource limits via `resource.setrlimit` for CPU/memory, a hard wall-clock timeout, no network namespace) that executes only the user's `should_enter`/`should_exit`/`on_start` functions against the bar loop, and communicates results back over stdout/a pipe as JSON. This gives real OS-level process isolation (a crashed or hung strategy can't take down the Celery worker) instead of relying on `RestrictedPython`'s AST-level restrictions, which have had known sandbox-escape bypasses. The `ast.parse()` authoring-time check in Phase 3 is unchanged — it is still just a fast syntax/lint pass, not the security boundary.
+
+---
+
+### Predefined Templates
+
+Six code templates ship with Phase 3. Selecting one loads its code into Monaco — fully editable from that point. Templates are static strings served from the backend; no DB write happens when a template is selected.
+
+| Template | Entry condition | Exit condition |
+|---|---|---|
+| Blank slate | `...` with inline API comments | `...` |
+| SMA crossover | `fast_sma > slow_sma` | `fast_sma < slow_sma` |
+| RSI threshold | `RSI(14) < oversold` | `RSI(14) > overbought` |
+| MACD signal | MACD line crosses above signal line | MACD line crosses below signal line |
+| Bollinger breakout | Price crosses above upper band | Price drops below middle band |
+| Mean reversion | Z-score vs rolling mean below threshold | Z-score returns to zero |
+
+Served from `GET /strategies/templates` as a list of `{name, description, code, default_params}` objects. Defined as static strings in `backend/app/services/strategy_templates.py`.
+
+---
+
+### Code Validation
+
+Validation uses `ast.parse()` — no code is executed. Runs in under 5ms. Checks for:
+1. Valid Python syntax
+2. Presence of `should_enter` and `should_exit` function definitions
+3. Banned imports (anything other than `pandas`, `numpy`)
+
+```python
+import ast
+
+def validate_strategy_code(code: str) -> list[str]:
+    """Returns a list of error strings. Empty list means valid."""
+    errors = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"Syntax error on line {e.lineno}: {e.msg}"]
+
+    defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    if "should_enter" not in defined:
+        errors.append("Missing required function: should_enter(row, hist, p)")
+    if "should_exit" not in defined:
+        errors.append("Missing required function: should_exit(row, hist, p, pos)")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] not in ("pandas", "numpy"):
+                    errors.append(f"Import not allowed: {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] not in ("pandas", "numpy"):
+                errors.append(f"Import not allowed: from {node.module} import ...")
+
+    return errors
+```
+
+The frontend calls `POST /strategies/validate` on a 500ms debounce as the user types. Validation errors are rendered as red squiggles directly in Monaco via `monaco.editor.setModelMarkers()` using the line number from the error response.
+
+---
+
+### Monaco Editor Integration
+
+Monaco is loaded via `@monaco-editor/react` as a Next.js dynamic import with `ssr: false` to avoid server-side rendering errors (Monaco uses browser APIs unavailable in Node.js).
+
+```tsx
+// components/strategy/monaco-editor.tsx
+const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
+  ssr: false,
+  loading: () => <Skeleton className="h-full w-full" />
+})
+```
+
+**Install:** `npm install @monaco-editor/react`
+
+**Configuration:**
+- Theme: `vs-dark`
+- Language: `python`
+- Font: `JetBrains Mono` (loaded via `next/font/google` or a CDN fallback)
+- Line numbers: on
+- Minimap: off (too narrow in the split-pane layout)
+- Word wrap: off
+- `Cmd/Ctrl + S` keyboard shortcut wired to the save action via `editor.addCommand`
+
+The editor mounts with the selected template code pre-loaded. Code is stored in local React state (not Zustand — it does not need to be globally shared), and debounced to the `/strategies/validate` endpoint every 500ms.
+
+---
+
+### Params JSON Editor
+
+A plain monospace `<textarea>` below the Monaco editor holds the `params` JSON dict. On blur: parse and pretty-print, or show an inline "Invalid JSON" error. The params value is sent as-is to the backend which stores it in `config.params`. The user defines whatever keys their strategy code reads via `p["key"]`.
+
+No special frontend logic is needed — the params editor is just a textarea that validates JSON.
+
+---
+
+### New Folder Structure (Phase 3 additions only)
+
+```
+backend/app/
+├── routers/
+│   └── strategies.py              # CRUD + /validate + /templates endpoints
+├── schemas/
+│   └── strategy.py                # StrategyCreate, StrategyUpdate, StrategyResponse
+└── services/
+    ├── strategy_service.py        # CRUD with ownership checks, validate_strategy_code()
+    └── strategy_templates.py      # 6 static template objects (name, description, code, default_params)
+
+alembic/versions/
+└── 004_add_strategy_soft_delete.py  # Adds is_deleted BOOLEAN DEFAULT false to strategies
+
+frontend/
+├── app/(dashboard)/
+│   └── strategies/
+│       ├── page.tsx               # Strategy list with "New strategy" button + empty state
+│       ├── new/page.tsx           # Create new strategy — renders StrategyForm in create mode
+│       └── [id]/
+│           └── page.tsx           # View/edit strategy — StrategyForm pre-filled with saved code
+├── components/
+│   └── strategy/
+│       ├── monaco-editor.tsx      # Dynamic-imported Monaco wrapper (ssr: false, vs-dark, python)
+│       ├── strategy-form.tsx      # Full layout: config panel + Monaco editor + params editor + actions
+│       ├── template-picker.tsx    # 6 cards — click to load code into Monaco
+│       ├── params-editor.tsx      # Monospace textarea — JSON parse + pretty-print on blur
+│       ├── validation-badge.tsx   # Green tick (0 errors) or red "N errors" with first message
+│       ├── strategy-card.tsx      # Card in list view: name, 2-line code preview, actions
+│       └── console-panel.tsx      # Collapsible <pre> block — placeholder for Phase 4 output
+└── lib/
+    └── hooks/
+        └── use-strategy-validation.ts  # 500ms debounced POST /strategies/validate with error state
+```
+
+---
+
+### New FastAPI Endpoints (Phase 3)
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/strategies` | Returns all non-deleted strategies for the authenticated user |
+| `POST` | `/strategies` | Validates code with `ast.parse()`, creates strategy row, returns `StrategyResponse` |
+| `GET` | `/strategies/{id}` | Returns a single strategy — ownership-checked |
+| `PUT` | `/strategies/{id}` | Updates name, description, or config — re-validates code on update |
+| `DELETE` | `/strategies/{id}` | Soft-delete: sets `is_deleted = true`, does not remove the row |
+| `POST` | `/strategies/validate` | Validates code string — no DB write, no execution, returns `{valid: bool, errors: []}` |
+| `GET` | `/strategies/templates` | Returns the 6 predefined template objects |
+
+---
+
+### Build Sequence — Step by Step
+
+#### Day 7: Strategy Model + Backend CRUD
+
+- [x] Write Alembic migration `004_add_strategy_soft_delete` — adds `is_deleted BOOLEAN DEFAULT false` to `strategies` table; run it
+- [x] Create `backend/app/schemas/strategy.py` — `StrategyConfig`, `StrategyCreate`, `StrategyUpdate`, `StrategyResponse`
+- [x] Create `backend/app/services/strategy_templates.py` — 6 static template objects with code strings and `default_params`
+- [x] Create `backend/app/services/strategy_service.py` — CRUD functions with ownership checks; `validate_strategy_code()` using `ast.parse()` checking for `should_enter`, `should_exit`, and banned imports
+- [x] Create `backend/app/routers/strategies.py` — all 7 endpoints; validation runs before any DB write on `POST` and `PUT`
+- [x] Register strategies router in `backend/app/main.py`
+- [x] **Verify:** `POST /strategies/validate` with missing `should_exit` returns `{valid: false, errors: ["Missing required function: should_exit(row, hist, p, pos)"]}`. `GET /strategies/templates` returns 6 objects. `POST /strategies` with valid code creates a row; `DELETE /strategies/{id}` sets `is_deleted = true` without removing the row
+
+#### Day 8: Monaco Editor
+
+- [x] Install `@monaco-editor/react`: `cd frontend && npm install @monaco-editor/react`
+- [x] Create `frontend/components/strategy/monaco-editor.tsx` — dynamic import, `vs-dark` theme, `python` language, minimap off, `Cmd/Ctrl+S` command wired
+- [x] Create `frontend/lib/hooks/use-strategy-validation.ts` — 500ms debounced `POST /strategies/validate` that returns `{valid, errors}` and maps error line numbers to Monaco marker format
+- [x] Create `frontend/components/strategy/validation-badge.tsx` — green tick when `errors.length === 0`, red pill with count + first error message otherwise; updates as user types
+- [x] Create `frontend/components/strategy/params-editor.tsx` — monospace textarea, JSON parse + pretty-print on blur, inline "Invalid JSON" error on bad input
+- [x] Create `frontend/components/strategy/template-picker.tsx` — 6 cards with name + description; clicking calls `GET /strategies/templates`, finds the matching template, and calls an `onSelect(code, default_params)` callback to load into Monaco
+- [x] **Verify:** Monaco editor loads without SSR errors. Typing invalid Python triggers the validation badge within 500ms. Selecting "SMA crossover" template populates the editor with the correct code. Introducing a syntax error adds a red squiggle at the correct line
+
+#### Day 9: Strategy Form + List
+
+- [x] Create `frontend/components/strategy/strategy-form.tsx` — split layout: left config panel (name, description, position size, stop loss) + right Monaco editor + below params editor + save/discard action row; handles both create and edit modes via a `mode` prop
+- [x] Create `frontend/components/strategy/strategy-card.tsx` — shows name, 2-line monospace code preview with fade-out, description, `created_at`, Edit / Delete / Run (placeholder) actions
+- [x] Create `frontend/app/(dashboard)/strategies/page.tsx` — fetches `GET /strategies`, renders list of `StrategyCard` components; empty state: "No strategies yet — create your first one" with a "New strategy" button
+- [x] Create `frontend/app/(dashboard)/strategies/new/page.tsx` — renders `StrategyForm` in create mode with "Blank slate" template pre-loaded
+- [x] Create `frontend/app/(dashboard)/strategies/[id]/page.tsx` — fetches `GET /strategies/{id}`, renders `StrategyForm` pre-filled with existing code and params
+- [x] Wire `POST /strategies` on form submit; redirect to `/strategies/{id}` on success
+- [x] **Verify:** Create a strategy → appears in the list with a 2-line code preview. Click it → existing code and params load correctly into the Monaco editor
+
+#### Day 10: Console Panel + Final Polish
+
+- [x] Create `frontend/components/strategy/console-panel.tsx` — collapsible `<pre>` block; in Phase 3, renders placeholder text "Console output will appear here when you run a backtest." Ready for Phase 4 to wire in real `print()` output
+- [x] Wire Monaco editor markers: after each validation call, pass the error list to `monaco.editor.setModelMarkers()` so errors appear as red squiggles at the correct line number in the editor
+- [x] Add `Cmd/Ctrl + S` shortcut inside Monaco to call the save action without needing the mouse
+- [x] Template picker: add a code preview pane (read-only Monaco, 8 lines) that renders the template code before the user confirms loading it — gives a "before you commit" look
+- [x] Ensure strategy cards show a `<pre>` snippet of the first 2 lines of `config.code` with a CSS fade-out gradient at the bottom
+- [x] **Verify end-to-end:** Select "MACD signal" template → preview pane shows MACD code → load it → set params `{"fast": 12, "slow": 26, "signal": 9}` → save → card appears in list with MACD code snippet → click card → code and params reload exactly as saved → modify and re-save → changes persist
+
+---
+
+### Phase 3 Milestone
+
+> At the end of Phase 3 you can:
+> - Navigate to Strategies → New Strategy
+> - Select the "SMA crossover" template and see Python code load into the Monaco editor
+> - Introduce a syntax error — a red squiggle appears at the correct line and the validation badge shows the error count within 500ms
+> - Fix the error — the badge turns green
+> - Set params `{"fast": 20, "slow": 50}`, give the strategy a name, hit save
+> - The strategy card appears in the list with a 2-line code preview
+> - Click the card — the Monaco editor reloads the saved code exactly as written
+> - Check PostgreSQL: `SELECT id, name, config->>'params' as params FROM strategies;` → rows with code and params stored in JSONB
+> - Delete a strategy — `is_deleted` is set to `true` in the DB; the row is not removed; past backtests (Phase 4) can still reference it
 
 ---
 
@@ -780,11 +1092,55 @@ def is_fresh(latest_date: date) -> bool:
 
 > Status: ⏳ Not started.
 
+### Goals
+
+Let a user submit a backtest (strategy + ticker + date range + initial capital), run it safely in the isolated subprocess sandbox, compute standard performance metrics, and persist results and trades.
+
+### New tables
+
+| Table | Key columns |
+|---|---|
+| `backtests` | id, user_id, strategy_id, ticker_id, start_date, end_date, initial_capital `DECIMAL(12,4)`, status (`pending`/`running`/`completed`/`failed`), results `JSONB`, error_message, created_at |
+| `trades` | id, backtest_id (FK), entry_date, exit_date, entry_price, exit_price `DECIMAL(12,4)`, quantity, pnl, pnl_pct `DECIMAL(12,4)` |
+
+### API endpoints
+
+- `POST /backtests` creates a row with status `pending`, queues the Celery task, and returns the id immediately
+- `GET /backtests/{id}` polls status and results (frontend polls every 2s while status is `running`)
+- `GET /backtests` lists backtests for the authenticated user
+- `GET /backtests/{id}/trades` returns a paginated trade log
+
+### Celery task: `run_backtest(backtest_id)`
+
+1. Load strategy code, params, and price history for the requested ticker/date range
+2. Wrap the user's code in a harness that steps through each bar and injects `row`, `hist`, `p`, `pos`; calls `on_start` once, then `should_enter`/`should_exit` per bar
+3. Run the harness inside the isolated subprocess (30s timeout via `subprocess.run(timeout=30)`, memory cap via `resource.setrlimit(RLIMIT_AS, ...)`); the harness prints a single JSON blob of trades to stdout as its return channel
+4. Position sizing and stop-loss are applied by the harness itself, not the user's code, so strategies only need to emit enter/exit signals
+5. Compute metrics from the trade list: total return, CAGR, Sharpe ratio, max drawdown, win rate, average trade duration
+6. Bulk-insert trades and update `backtests.results` and status; on timeout or exception, status becomes `failed` with the verbatim (path-sanitized) error surfaced
+
+### Known limitation (to log, not fix in this phase)
+
+True network isolation for the subprocess isn't practical without extra container privileges. The sandbox relies on the timeout, the memory limit, and Phase 3's banned-import check together, rather than a network namespace. This is intentional for a portfolio-scope project and should be documented in the decisions log so it doesn't read as an oversight.
+
 ---
 
 ## Phase 5: Visualisations (Days 15–18)
 
 > Status: ⏳ Not started.
+
+### Goals
+
+Turn a completed backtest into something readable, all charts built from Recharts/D3 per the project's no-embeds principle.
+
+### Components
+
+- Equity curve chart: portfolio value over time, with an optional buy-and-hold benchmark line overlaid for comparison
+- Drawdown chart beneath it: shaded area showing percentage down from peak
+- Metrics cards: total return, CAGR, Sharpe ratio, max drawdown, win rate, total trades
+- Trade log table: sortable, paginated, entry/exit price and date, PnL per trade
+- Entry/exit markers plotted directly on the existing Phase 2 candlestick chart, so the user can see exactly where the strategy fired against real price action
+- Results page polls `GET /backtests/{id}` while status is `running`, shows a progress state, then renders everything above once status is `completed`
 
 ---
 
@@ -792,11 +1148,37 @@ def is_fresh(latest_date: date) -> bool:
 
 > Status: ⏳ Not started.
 
+### Goals
+
+Round out the backtester with features that go beyond a single run, using the tools already reserved for this phase (Gemini free tier, Resend, slowapi).
+
+### Planned features
+
+- **Gemini 1.5 Flash summary**: plain-English explanation of a backtest's results (for example, entry count, whether it mostly fired during downtrends, comparison to buy-and-hold) shown on the results page
+- **Backtest comparison**: select 2+ backtests and overlay their equity curves on one chart
+- **Parameter sweep / grid search**: run a strategy across a full grid of param value combinations using a Celery `group`/`chord`, with a results table ranking combinations by a chosen metric (confirmed in scope, full grid rather than a scaled-down preset list)
+- **Email notifications** via Resend: when a long-running backtest finishes, email the user a link to the results
+- **Rate limiting** via `slowapi` on backtest submission and strategy validation endpoints, since both are compute/subprocess-bound
+
 ---
 
 ## Phase 7: Containerisation and Deployment (Days 23–25)
 
 > Status: ⏳ Not started.
+
+### Goals
+
+Ship the project on the fully free deployment stack already committed to (Fly.io backend, Vercel frontend), with production-grade container and CI/CD setup.
+
+### Planned work
+
+- Multi-stage production Dockerfiles for frontend and backend, plus `docker-compose.prod.yml`
+- Nginx reverse proxy in front of the API (already listed in the infra table)
+- GitHub Actions: run tests on push, build images, deploy on merge to main
+- Fly.io: api, worker, redis, and Postgres (Fly Postgres or a managed free tier)
+- Vercel hobby for the frontend, environment variables and secrets configured on both platforms
+- Health check endpoints and basic structured logging
+- Final README pass with setup instructions and screenshots or a demo
 
 ---
 
@@ -834,6 +1216,26 @@ def is_fresh(latest_date: date) -> bool:
 | Phase 2 | `market_data_service.py`'s cache/DB coverage check verifies both `covers_start()` (earliest cached row is within 7 days of the requested `start`) and `covers_end()`, not just "is the latest row fresh" | The original check only looked at whether the *latest* row was recent. A custom range starting earlier than data already cached from a prior query (e.g. requesting 2010 after already having 2022+ cached) silently matched that later data and served an incomplete series — found live when an early custom start date rendered a chart clipped to whatever had already been fetched. `covers_end()` also fixes a second latent bug: comparing the latest row to *today* made any historical range (end date in the past) permanently look "never fresh," forcing a pointless re-fetch on every single request for that range even when the data was already complete |
 | Phase 2 | `DateRangePicker` commits a typed date to the shared store only `onBlur`, with a plausibility check (4-digit year ≥ 1900), instead of on every `onChange` | Native `<input type="date">` fires `onChange` on every keystroke while typing a segment — typing "2020" into the year walks the field through "0002" → "0020" → "0200" → "2020", each committing a full network request. Confirmed live in the API access logs. Beyond wasting requests, this created a race: whichever request happened to resolve *last* (not the one matching what was actually typed) is what rendered, making the chart appear to silently "revert" after a second edit |
 | Phase 2 | `PriceChart`'s X-axis ticks are computed explicitly (`computeTicks()` — up to 10 evenly-spaced bars by index, always including the true first/last) instead of using Recharts' `interval="preserveStartEnd"` + `minTickGap` | That heuristic combo mislabeled the axis start once the bar count got large (e.g. a 5-year NVDA range showed "Jan '22" as the leftmost label even though the underlying data correctly started mid-2021, confirmed by inspecting the raw cached response) — the data was always correct, only the tick heuristic was wrong |
+| Phase 2 | `PriceChart` defaults to candlestick (OHLC) view rather than a line chart | Candlestick provides more information per bar — open, high, low, close all visible simultaneously, which is what a developer inspecting price action actually needs. Line chart is still available as a toggle for cleaner long-range trend views |
+| Phase 2 | Candlestick rendered via a custom Recharts `Bar` shape (`CandlestickBar`) rather than adding a separate financial charting library | Keeps one charting library (Recharts + D3, already in the stack) for both chart types; the custom shape accesses `props.yAxis.scale` — the live d3 scale Recharts passes to every custom shape — to correctly position open/high/low/close pixel coordinates from the payload. No additional dependency needed |
+| Phase 2 | `trades` table price columns use `DECIMAL(12,4)` instead of `FLOAT` | Consistent with the Phase 2 decision on `price_history`. FLOAT silently accumulates rounding errors on financial values; DECIMAL is exact. Backtest PnL calculations that chain many multiplications amplify any per-trade rounding error, so precision matters here more than in the chart layer |
+| Phase 3 | Monaco Editor loaded via `@monaco-editor/react` with `ssr: false` dynamic import | Monaco uses browser-only APIs (`window`, `document`, `requestAnimationFrame`) that are unavailable in Node.js; server-side rendering it throws a module-not-found or runtime error. Dynamic import with `ssr: false` defers loading to the client entirely |
+| Phase 3 | Code validation uses `ast.parse()` at authoring time, not code execution | `ast.parse()` validates syntax and checks for `should_enter`/`should_exit` definitions and banned imports without running anything. Safe, fast (< 5ms per validation call), requires no sandboxing. The real execution boundary is in Phase 4 (RestrictedPython). Two layers: fast feedback at authoring time, hard enforcement at run time |
+| Phase 3 | Single `code` JSONB field over typed strategy configs with a `type` enum | Removes all strategy-type restrictions permanently. The user can write SMA crossover, RSI, MACD, Bollinger Bands, mean reversion, multi-leg strategies, ML model scoring, or anything expressible in Pandas — all without any backend changes. Adding a new "strategy type" is just writing new code in Monaco |
+| Phase 3 | `params` stored as a free-form JSON dict the user defines entirely | No frontend changes are required when the strategy logic evolves. If the user changes `p["fast"]` to `p["lookback_period"]` in their code, they update the params textarea — nothing else changes. Typed parameter schemas would require frontend form updates on every strategy logic change |
+| Phase 3 | Soft-delete (`is_deleted = true`) rather than hard-delete for strategies | A strategy may be referenced by past backtests stored in `backtests.strategy_id`. Hard-deleting the strategy row would orphan those backtest records and break the results page. Soft-delete keeps referential integrity and lets the backtest history page still show the strategy name and code for historical context |
+| Phase 3 | Strategies list page is a server component that fetches the initial `GET /strategies` data with the NextAuth session token, handing the array to a small client component (`StrategyListClient`) only for delete interactivity | Keeps the list's first paint server-rendered (no loading spinner on navigation) while still allowing optimistic client-side removal on delete, without making the whole page a client component just for one button's `onClick` |
+| Phase 3 | Card/link styling uses `Link` with `buttonVariants({...})` classes directly instead of `<Button asChild><Link/></Button>` | This project's shadcn setup uses `@base-ui/react`, whose `Button` has no `asChild` prop (base-ui uses a `render` prop instead and recommends styling anchor tags directly) — same constraint as the Phase 1 sidebar/header decision, recurring here for the strategy card's Edit link |
+| Phase 3 | Strategy card renders `created_at` with a hand-rolled UTC `YYYY-MM-DD` formatter instead of `Date.toLocaleDateString()` | `toLocaleDateString()` with no explicit locale resolves to the *runtime's* default locale — confirmed live to differ between the Next.js server process (rendered `12/07/2026`) and the browser (rendered `7/12/2026`), which is a textbook React hydration mismatch on any server-rendered list of strategies. A fixed, explicit format removes the ambiguity entirely regardless of where it renders |
+| Phase 3 | Discovered live: this dev container's `next dev --turbopack` does not reliably pick up file changes written from the host through the Windows bind mount — edits landed on disk (confirmed via `docker compose exec frontend cat <file>`) but kept serving the pre-edit compiled output until `docker compose restart frontend` | `WATCHPACK_POLLING=true` (set in `docker-compose.dev.yml`) is a Webpack/Watchpack-specific escape hatch for exactly this class of bind-mount problem — it does not apply to Turbopack's own file watcher, which appears to miss native filesystem events that don't cross the Windows→WSL2/Docker boundary reliably. Until this is fixed with a Turbopack-specific polling flag, expect to restart the `frontend` container after editing files from the host while `docker compose up` is already running |
+| Phase 3 | Banned imports enforced at both authoring time (Phase 3, `ast.parse()`) and execution time (Phase 4, isolated subprocess) | Defence in depth. The authoring check gives the user instant inline feedback. The execution check is the real security boundary that cannot be bypassed. A malicious user who crafts a payload that bypasses the AST check still hits the execution sandbox |
+| Phase 2 (fixed in Phase 3 QA) | Candlestick mode was documented as shipped in Phase 2 but never actually rendered — `chartType` didn't exist in the Zustand store, `candlestick-bar.tsx` didn't exist, and `price-chart.tsx` only ever rendered a `Line`. Found live when the user reported still seeing a line chart | The original Phase 2 checklist and milestone claimed this was "confirmed live," which was inaccurate — likely written ahead of the actual implementation and never caught because the line chart still looked reasonable. Lesson: milestone checkmarks need an actual browser check against the specific claim (candlestick, not just "a chart renders"), not just "the page loads" |
+| Phase 3 QA | `props.yAxis.scale` (the originally spec'd way to access the y-scale inside a custom `Bar` `shape`) does not exist on this Recharts version's shape props; a hook-based approach (`useXAxisScale`/`useYAxisScale`/`usePlotArea` from a custom component rendered directly as a chart child, and also via the `Customized` wrapper) computed correct pixel coordinates and logged successfully but its returned JSX never actually committed to the DOM in either case, with no thrown error — confirmed by adding an unconditional hardcoded probe `<rect>` that also never appeared, ruling out any data/logic bug in the render path itself | Recharts 3.9.2 substantially rewrote the internal architecture (Redux-based state, `useAppSelector` hooks) versus the v1/v2 APIs the original plan assumed. The fix that actually works: give `<Bar>` an array-valued (`[min, max]`) `dataKey` — Recharts' native "range bar" support, which passes both ends through the real `yAxis.scale.map` internally — and use the fully-documented, stable `shape` render-prop for styling. Two such Bars (thin "wick" spanning `[low, high]`, wider "body" spanning `[min(open,close), max(open,close)]`) reproduce a candlestick using only public, working Recharts API surface |
+| Phase 3 QA | Price `YAxis` domain and ticks are explicitly rounded/computed (`priceMin`/`priceMax` floored/ceiled to 2dp, 6 evenly-spaced `ticks`) rather than passing raw `Math.min(...lows)*0.99` / `Math.max(...highs)*1.01` floats with automatic tick generation | Confirmed live: an unrounded domain like `[10.70486972808838, 238.90539321899413]` caused Recharts' automatic tick generator to render garbled labels — e.g. `1899413`, which is literally the tail digits of `238.90539321899413` — instead of a formatted price. This is the same class of bug as the already-documented X-axis `computeTicks()` fix; Recharts' automatic tick placement in this version isn't trustworthy for either axis with real (non-round) data |
+| Phase 3/4 | Phase 4 execution sandbox changed from in-process `RestrictedPython` to an isolated OS subprocess per backtest (resource limits + timeout + no network namespace) | `RestrictedPython` only restricts at the AST/bytecode level and has had documented sandbox-escape bypasses; it also runs in the same process as the Celery worker, so a successful escape or an uncaught crash can affect the worker itself. A subprocess gives real OS-level isolation — a hung or crashed strategy is killed and cleaned up without touching the worker process. Phase 3's `ast.parse()` authoring-time validation is unaffected either way; it was always a fast lint pass, not the security boundary |
+| Phase 4 (planning) | Position sizing and stop-loss are applied by the backtest harness, not the user's strategy code | Keeps user-authored strategies limited to entry/exit signals, which is all the sandbox API contract (`row`, `hist`, `p`, `pos`) exposes. Risk management logic living in the harness also means it's consistent and auditable across every strategy, rather than reimplemented (or skipped) inconsistently by each user |
+| Phase 4 (planning) | Network isolation for the subprocess sandbox is out of scope; the timeout, memory limit, and Phase 3 banned-import check are treated as the combined security boundary | True network namespacing isn't practical without extra container privileges on the target deployment (Fly.io free tier). Documented here explicitly so the gap reads as a scoped decision rather than an oversight |
+| Phase 6 (planning) | Parameter sweep runs a full grid search over param combinations (via Celery `group`/`chord`), not a scaled-down preset list | Confirmed directly with the user; kept as originally planned despite adding more implementation complexity than a preset-combo shortcut would |
 
 ---
 
@@ -906,4 +1308,56 @@ docker compose exec redis redis-cli GET "tickers:search:AAPL"
 
 # Clear all OHLCV cache entries (force re-fetch on next request)
 docker compose exec redis redis-cli --scan --pattern "ohlcv:*" | xargs docker compose exec -T redis redis-cli DEL
+
+# --- Phase 3 commands ---
+
+# Install Monaco Editor React wrapper
+cd frontend && npm install @monaco-editor/react
+
+# Run soft-delete migration for strategies table
+docker compose exec api alembic upgrade head
+
+# Test strategy code validation endpoint (should return missing should_exit error)
+curl -X POST "http://localhost:8000/strategies/validate" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "def should_enter(row, hist, p):\n    return True"}'
+
+# Test validation with banned import (should return import error)
+curl -X POST "http://localhost:8000/strategies/validate" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "import os\ndef should_enter(row, hist, p):\n    return True\ndef should_exit(row, hist, p, pos):\n    return False"}'
+
+# Fetch all predefined strategy templates
+curl "http://localhost:8000/strategies/templates"
+
+# Create a new strategy (replace <token> with a real JWT from /users/login)
+curl -X POST "http://localhost:8000/strategies" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "SMA crossover",
+    "description": "Fast MA crosses above slow MA",
+    "config": {
+      "code": "import pandas as pd\ndef should_enter(row, hist, p):\n    fast = hist[\"adj_close\"].rolling(p[\"fast\"]).mean().iloc[-1]\n    slow = hist[\"adj_close\"].rolling(p[\"slow\"]).mean().iloc[-1]\n    return fast > slow\ndef should_exit(row, hist, p, pos):\n    fast = hist[\"adj_close\"].rolling(p[\"fast\"]).mean().iloc[-1]\n    slow = hist[\"adj_close\"].rolling(p[\"slow\"]).mean().iloc[-1]\n    return fast < slow",
+      "params": {"fast": 20, "slow": 50},
+      "position_size": 0.10,
+      "stop_loss": 0.05
+    }
+  }'
+
+# List all strategies for the authenticated user
+curl "http://localhost:8000/strategies" \
+  -H "Authorization: Bearer <token>"
+
+# Soft-delete a strategy (sets is_deleted = true, does not remove the row)
+curl -X DELETE "http://localhost:8000/strategies/<strategy-id>" \
+  -H "Authorization: Bearer <token>"
+
+# Verify soft-delete worked — row should still exist with is_deleted = true
+docker compose exec db psql -U postgres -d backtester \
+  -c "SELECT id, name, is_deleted FROM strategies ORDER BY created_at DESC LIMIT 5;"
+
+# Inspect strategy config stored in JSONB
+docker compose exec db psql -U postgres -d backtester \
+  -c "SELECT name, config->>'params' as params, LEFT(config->>'code', 80) as code_preview FROM strategies WHERE is_deleted = false;"
 ```
