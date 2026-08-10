@@ -50,10 +50,13 @@ export function StrategyCard({ strategy, onDelete }: StrategyCardProps) {
         >
           Edit
         </Link>
-        <Button size="sm" variant="outline" disabled className="gap-1">
+        <Link
+          href={`/backtests/new?strategyId=${strategy.id}`}
+          className={cn(buttonVariants({ size: "sm", variant: "outline" }), "gap-1")}
+        >
           <Play className="size-3" />
           Run
-        </Button>
+        </Link>
         <Button
           size="sm"
           variant="ghost"

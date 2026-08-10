@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import health, market_data, strategies, tickers, users
+from app.routers import backtests, health, market_data, strategies, tickers, users
 
 app = FastAPI(title="Strategy Backtester API")
 
@@ -18,3 +18,4 @@ app.include_router(users.router)
 app.include_router(tickers.router)
 app.include_router(market_data.router)
 app.include_router(strategies.router)
+app.include_router(backtests.router)

@@ -80,6 +80,59 @@ export interface ValidateResponse {
   errors: string[];
 }
 
+export interface BacktestMetrics {
+  total_return: number;
+  cagr: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  win_rate: number;
+  avg_trade_duration_days: number;
+  num_trades: number;
+  final_equity: number;
+}
+
+export interface EquityPoint {
+  date: string;
+  value: number;
+}
+
+export interface BacktestResults {
+  metrics: BacktestMetrics;
+  equity_curve: EquityPoint[];
+  console_output: string;
+}
+
+export type BacktestStatus = "pending" | "running" | "done" | "failed";
+
+export interface Backtest {
+  id: string;
+  strategy_id: string;
+  user_id: string;
+  ticker: string;
+  start_date: string;
+  end_date: string;
+  initial_capital: number;
+  status: BacktestStatus;
+  results: BacktestResults | null;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface Trade {
+  id: string;
+  backtest_id: string;
+  symbol: string;
+  entry_date: string;
+  exit_date: string | null;
+  entry_price: number;
+  exit_price: number | null;
+  quantity: number;
+  direction: string;
+  pnl: number | null;
+  pnl_pct: number | null;
+}
+
 class APIError extends Error {
   status: number;
 
@@ -178,6 +231,37 @@ export const apiClient = {
   deleteStrategy: (accessToken: string, id: string) =>
     request<null>(`/strategies/${id}`, {
       method: "DELETE",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }),
+
+  listBacktests: (accessToken: string) =>
+    request<Backtest[]>("/backtests", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }),
+
+  getBacktest: (accessToken: string, id: string) =>
+    request<Backtest>(`/backtests/${id}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }),
+
+  createBacktest: (
+    accessToken: string,
+    input: {
+      strategy_id: string;
+      ticker: string;
+      start_date: string;
+      end_date: string;
+      initial_capital: number;
+    }
+  ) =>
+    request<Backtest>("/backtests", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(input),
+    }),
+
+  listTrades: (accessToken: string, id: string) =>
+    request<Trade[]>(`/backtests/${id}/trades`, {
       headers: { Authorization: `Bearer ${accessToken}` },
     }),
 };

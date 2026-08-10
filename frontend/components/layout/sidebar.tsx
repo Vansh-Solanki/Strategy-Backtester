@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
-import { LayoutDashboard, LineChart, TrendingUp, User, LogOut } from "lucide-react";
+import { LayoutDashboard, LineChart, PlayCircle, TrendingUp, User, LogOut } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/strategies", label: "Strategies", icon: LineChart },
+  { href: "/backtests", label: "Backtests", icon: PlayCircle },
   { href: "/market-data", label: "Market Data", icon: TrendingUp },
   { href: "/profile", label: "Profile", icon: User },
 ];

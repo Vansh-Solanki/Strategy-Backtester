@@ -64,7 +64,7 @@
 | 1 | Foundation | Days 1–3 | ✅ Complete |
 | 2 | Data layer | Days 4–6 | ✅ Complete |
 | 3 | Strategy builder | Days 7–10 | ✅ Complete |
-| 4 | Backtest engine | Days 11–14 | ⏳ Not started |
+| 4 | Backtest engine | Days 11–14 | ✅ Complete |
 | 5 | Visualisations | Days 15–18 | ⏳ Not started |
 | 6 | Advanced features | Days 19–22 | ⏳ Not started |
 | 7 | Containerisation and deployment | Days 23–25 | ⏳ Not started |
@@ -1090,38 +1090,50 @@ frontend/
 
 ## Phase 4: Backtest Engine (Days 11–14)
 
-> Status: ⏳ Not started.
+> Status: ✅ Complete (not yet verified live — Docker Desktop was not running during implementation; run `docker compose up --build` and exercise the flow before treating this as fully confirmed).
 
 ### Goals
 
 Let a user submit a backtest (strategy + ticker + date range + initial capital), run it safely in the isolated subprocess sandbox, compute standard performance metrics, and persist results and trades.
 
-### New tables
+### Tables (extended, not new)
 
-| Table | Key columns |
+`backtests` and `trades` were already created by Phase 1's initial migration. Phase 4 added two columns to `backtests` rather than introducing new tables:
+
+| Table | Columns added in Phase 4 |
 |---|---|
-| `backtests` | id, user_id, strategy_id, ticker_id, start_date, end_date, initial_capital `DECIMAL(12,4)`, status (`pending`/`running`/`completed`/`failed`), results `JSONB`, error_message, created_at |
-| `trades` | id, backtest_id (FK), entry_date, exit_date, entry_price, exit_price `DECIMAL(12,4)`, quantity, pnl, pnl_pct `DECIMAL(12,4)` |
+| `backtests` | `initial_capital` `NUMERIC(12,4)` (default 10000), `error_message` `TEXT` (nullable) |
+
+> `ticker` remained a plain `VARCHAR(20)` (not `ticker_id`) and `status` kept its existing Phase 1 enum values `pending`/`running`/`done`/`failed` (not `completed`) — see Decisions Log. `trades.pnl`/`pnl_pct` also stayed `FLOAT` (already existing from Phase 1) rather than moving to `DECIMAL(12,4)`, to avoid an unplanned migration on a column that already existed and works.
 
 ### API endpoints
 
-- `POST /backtests` creates a row with status `pending`, queues the Celery task, and returns the id immediately
-- `GET /backtests/{id}` polls status and results (frontend polls every 2s while status is `running`)
-- `GET /backtests` lists backtests for the authenticated user
-- `GET /backtests/{id}/trades` returns a paginated trade log
+- `POST /backtests` — validates strategy ownership, creates a row with status `pending`, queues `run_backtest.delay(id)`, and returns the row immediately
+- `GET /backtests/{id}` — polls status and results (frontend polls every 2s while status is `pending`/`running`)
+- `GET /backtests` — lists backtests for the authenticated user
+- `GET /backtests/{id}/trades` — paginated trade log (`page`/`page_size` query params)
 
 ### Celery task: `run_backtest(backtest_id)`
 
-1. Load strategy code, params, and price history for the requested ticker/date range
-2. Wrap the user's code in a harness that steps through each bar and injects `row`, `hist`, `p`, `pos`; calls `on_start` once, then `should_enter`/`should_exit` per bar
-3. Run the harness inside the isolated subprocess (30s timeout via `subprocess.run(timeout=30)`, memory cap via `resource.setrlimit(RLIMIT_AS, ...)`); the harness prints a single JSON blob of trades to stdout as its return channel
-4. Position sizing and stop-loss are applied by the harness itself, not the user's code, so strategies only need to emit enter/exit signals
-5. Compute metrics from the trade list: total return, CAGR, Sharpe ratio, max drawdown, win rate, average trade duration
-6. Bulk-insert trades and update `backtests.results` and status; on timeout or exception, status becomes `failed` with the verbatim (path-sanitized) error surfaced
+1. Loads the strategy code/params/position sizing, the ticker, and price history for the requested date range from the DB (via `task_db_session()`, same fork-safe pattern as `fetch_ohlcv`)
+2. Serialises everything to JSON and pipes it to `backend/app/workers/sandbox/harness.py` via `subprocess.run([sys.executable, harness_path], input=..., timeout=30)`
+3. The harness `exec()`s the strategy code against a restricted `__builtins__` (banned: `open`, `exec`, `eval`, `compile`, `input`, `breakpoint`; `__import__` is wrapped to only allow `pandas`/`numpy`), applies `resource.setrlimit` for `RLIMIT_CPU` (25s) and `RLIMIT_AS` (256MB) where the POSIX `resource` module is available, steps bar-by-bar building `hist` as a growing `DataFrame` slice, calls `on_start` once then `should_enter`/`should_exit` per bar, and applies position sizing + stop-loss itself (the user's code only emits signals)
+4. The user's own `print()` output is captured via `contextlib.redirect_stdout` into a separate `console_output` string so it never corrupts the single JSON result line the harness writes to real stdout as its return channel
+5. The parent task computes metrics from the harness's trade list and equity curve: total return, CAGR, Sharpe ratio (annualised via `sqrt(252)`), max drawdown, win rate, average trade duration
+6. Bulk-inserts `Trade` rows and updates `backtests.results` (`{metrics, equity_curve, console_output}`) and `status`; on subprocess timeout, non-zero exit, malformed output, or a harness-reported error, status becomes `failed` with `error_message` set (truncated to 2000 chars)
 
-### Known limitation (to log, not fix in this phase)
+### Frontend
 
-True network isolation for the subprocess isn't practical without extra container privileges. The sandbox relies on the timeout, the memory limit, and Phase 3's banned-import check together, rather than a network namespace. This is intentional for a portfolio-scope project and should be documented in the decisions log so it doesn't read as an oversight.
+- `components/backtest/backtest-form.tsx` — ticker/date-range/initial-capital form, reached from a strategy card's "Run" button (`/backtests/new?strategyId=...`)
+- `components/backtest/backtest-detail-client.tsx` — polls `GET /backtests/{id}` every 2s while pending/running, then renders a metrics grid, a plain trade table, and the captured console output once `done`, or the error message if `failed`
+- `components/backtest/backtest-list-client.tsx` + `app/(dashboard)/backtests/page.tsx` — list of the user's backtests with a status badge
+- Sidebar gained a "Backtests" nav link; the strategy card's previously-disabled "Run" button now links to the new-backtest form
+
+Equity curve charting, the drawdown chart, and entry/exit markers on the candlestick chart are explicitly Phase 5 scope — Phase 4's detail page shows metrics and the raw trade log only.
+
+### Known limitation (logged, not fixed in this phase)
+
+True network isolation for the subprocess isn't practical without extra container privileges. The sandbox relies on the timeout, the memory limit, the restricted-builtins `__import__` check, and Phase 3's `ast.parse()` banned-import check together, rather than a network namespace. This is intentional for a portfolio-scope project.
 
 ---
 
@@ -1236,6 +1248,12 @@ Ship the project on the fully free deployment stack already committed to (Fly.io
 | Phase 4 (planning) | Position sizing and stop-loss are applied by the backtest harness, not the user's strategy code | Keeps user-authored strategies limited to entry/exit signals, which is all the sandbox API contract (`row`, `hist`, `p`, `pos`) exposes. Risk management logic living in the harness also means it's consistent and auditable across every strategy, rather than reimplemented (or skipped) inconsistently by each user |
 | Phase 4 (planning) | Network isolation for the subprocess sandbox is out of scope; the timeout, memory limit, and Phase 3 banned-import check are treated as the combined security boundary | True network namespacing isn't practical without extra container privileges on the target deployment (Fly.io free tier). Documented here explicitly so the gap reads as a scoped decision rather than an oversight |
 | Phase 6 (planning) | Parameter sweep runs a full grid search over param combinations (via Celery `group`/`chord`), not a scaled-down preset list | Confirmed directly with the user; kept as originally planned despite adding more implementation complexity than a preset-combo shortcut would |
+| Phase 4 | Kept the Phase 1 `backtests`/`trades` schema as-is (ticker `VARCHAR`, status enum `pending`/`running`/`done`/`failed`, `trades` price columns `FLOAT`) instead of the `ticker_id`/`completed`/`DECIMAL` shape sketched in the Phase 4 planning section, only adding `initial_capital` and `error_message` columns | The tables were already created and in use by the initial migration by the time Phase 4 was implemented. Renaming the enum value or switching to a `ticker_id` FK would have required a data migration and touched already-working code (Trade inserts, existing model relationships) for no functional gain — `ticker` as a plain symbol string is exactly what every other part of the codebase already keys off of (Strategy, PriceHistory lookups by symbol) |
+| Phase 4 | Strategy execution sandbox is a real OS subprocess (`subprocess.run([sys.executable, harness.py], ...)`), not an in-process call | Matches the Phase 3/4 planning decision already logged above. A hung or crashed strategy is killed by the timeout/OS without touching the Celery worker process |
+| Phase 4 | The harness redirects the user's own `print()` output into a separate captured string (`console_output`) instead of leaving it on real stdout | The parent task's only contract with the subprocess is a single JSON line on stdout as the return channel. Any interleaved `print()` from user code would corrupt that JSON and make every strategy that logs anything fail to parse |
+| Phase 4 | Position sizing and stop-loss enforcement live entirely in `harness.py`, not in a separate step after the fact | Matches the Phase 4 planning decision — keeps the boundary between "what the user's code decides" (enter/exit signals) and "what the platform guarantees" (position sizing, risk limits) sharp and auditable in one place |
+| Phase 4 | `run_backtest` re-fetches the `Backtest` row from a fresh `task_db_session()` before writing final results, rather than reusing the session/object from the initial data-loading query | `AsyncSession.rollback()` expires all attached objects, and refreshing an expired attribute on an `AsyncSession` requires an `await` that isn't available from a plain attribute access — touching the original object after any rollback risks a `MissingGreenlet` error. Re-querying in a new session sidesteps this entirely, at the cost of one extra query |
+| Phase 4 | Frontend backtest detail page shows a metrics grid and a plain HTML trade table only — no equity curve chart, no drawdown chart, no entry/exit markers on the candlestick | Those are explicitly scoped to Phase 5 in this document. Building them now would duplicate work once Phase 5's chart components exist and risk drifting from whatever chart conventions Phase 5 settles on |
 
 ---
 
@@ -1360,4 +1378,24 @@ docker compose exec db psql -U postgres -d backtester \
 # Inspect strategy config stored in JSONB
 docker compose exec db psql -U postgres -d backtester \
   -c "SELECT name, config->>'params' as params, LEFT(config->>'code', 80) as code_preview FROM strategies WHERE is_deleted = false;"
+
+# --- Phase 4 commands ---
+
+# Run the initial_capital/error_message migration
+docker compose exec api alembic upgrade head
+
+# Submit a backtest (replace <token> and <strategy-id>)
+curl -X POST "http://localhost:8000/backtests" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"strategy_id": "<strategy-id>", "ticker": "AAPL", "start_date": "2023-01-01", "end_date": "2023-12-31", "initial_capital": 10000}'
+
+# Poll a backtest's status/results
+curl "http://localhost:8000/backtests/<backtest-id>" -H "Authorization: Bearer <token>"
+
+# Fetch a backtest's trade log
+curl "http://localhost:8000/backtests/<backtest-id>/trades" -H "Authorization: Bearer <token>"
+
+# Watch the worker execute the sandboxed strategy subprocess
+docker compose logs -f worker
 ```

@@ -7,7 +7,11 @@ celery_app = Celery(
     "backtester",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.workers.tasks.seed_tickers", "app.workers.tasks.fetch_ohlcv"],
+    include=[
+        "app.workers.tasks.seed_tickers",
+        "app.workers.tasks.fetch_ohlcv",
+        "app.workers.tasks.run_backtest",
+    ],
 )
 
 celery_app.conf.update(
